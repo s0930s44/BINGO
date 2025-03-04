@@ -5,7 +5,7 @@ const { Server } = require('socket.io');
 
 const app = express();
 
-// CORS 設定：允許所有來源（測試階段）
+// 使用 CORS，允許所有來源（測試階段）
 app.use(cors({
     origin: '*',
     methods: ['GET', 'POST'],
@@ -21,19 +21,24 @@ const io = new Server(server, {
     }
 });
 
-const users = {};         // key: socket.id → { username, room, isAdmin, lineCount }
-const drawnNumbers = {};  // key: roomName → [number, ...]
-const rooms = {};         // key: roomName → 目前房間人數
-const roomTimers = {};    // key: roomName → setTimeout 計時器
+// 儲存所有使用者資料：{ username, room, isAdmin, lineCount }
+const users = {};
+// 儲存各房間的開獎號碼：{ room: [number, ...] }
+const drawnNumbers = {};
+// 儲存目前每個房間的連線人數：{ room: count }
+const rooms = {};
+// 用來設定房間空置後自動刪除的計時器
+const roomTimers = {};
 
 io.on('connection', (socket) => {
     console.log(`用戶連線: ${socket.id}`);
 
-    // 剛連線時，推送目前房間列表給該用戶
+    // 連線後先發送最新房間列表給該用戶
     socket.emit('roomsListUpdate', Object.keys(rooms));
 
-    // 使用者登入
+    // 使用者登入事件
     socket.on('login', (data) => {
+        // 驗證 username 與 room 是否存在且為字串
         if (!data.username || !data.room || typeof data.username !== 'string' || typeof data.room !== 'string') {
             socket.emit('loginError', { message: '使用者名稱與房間名稱不能為空，且必須為字串' });
             return;
@@ -44,39 +49,58 @@ io.on('connection', (socket) => {
             return;
         }
 
-        // 保存使用者資料
+        // 若使用者不是管理員，檢查該房間是否存在且有管理員
+        if (!isAdmin) {
+            if (!rooms[data.room]) {
+                socket.emit('loginError', { message: '房間不存在，請由管理員創建房間' });
+                return;
+            }
+            let adminExists = false;
+            for (const id in users) {
+                if (users[id].room === data.room && users[id].isAdmin) {
+                    adminExists = true;
+                    break;
+                }
+            }
+            if (!adminExists) {
+                socket.emit('loginError', { message: '該房間尚未創建或管理員不在線，請等待管理員創建房間' });
+                return;
+            }
+        } else {
+            // 若是管理員，若房間不存在則建立房間（即使目前只有管理員）
+            if (!rooms[data.room]) {
+                rooms[data.room] = 0;
+            }
+        }
+
+        // 更新房間人數（不論管理員或玩家，都要加1）
+        rooms[data.room]++;
+        // 儲存使用者資料並加入房間
         users[socket.id] = { username: data.username, room: data.room, isAdmin };
         socket.join(data.room);
         console.log(`用戶 ${data.username} (${isAdmin ? '管理員' : '玩家'}) 加入房間 ${data.room}`);
 
-        // 若該房間尚未有開獎紀錄，初始化
+        // 初始化該房間的開獎紀錄（若尚未初始化）
         if (!drawnNumbers[data.room]) {
             drawnNumbers[data.room] = [];
         }
-        // 更新房間人數
-        if (!rooms[data.room]) {
-            rooms[data.room] = 0;
-        }
-        rooms[data.room]++;
 
-        // 若之前設定了刪除房間的計時器，且有人又加入該房間，就清除計時器
+        // 若該房間曾設定過自動刪除的計時器，則清除
         if (roomTimers[data.room]) {
             clearTimeout(roomTimers[data.room]);
             delete roomTimers[data.room];
         }
 
         updateRoomsList();
-
         socket.emit('loginSuccess', { message: '登入成功', room: data.room, isAdmin });
         updateAdminInfo(data.room);
     });
 
-    // 前端要求更新房間列表
     socket.on('requestRoomsList', () => {
         socket.emit('roomsListUpdate', Object.keys(rooms));
     });
 
-    // 管理員開獎
+    // 管理員開獎事件：傳入號碼後驗證並廣播
     socket.on('drawNumber', (payload) => {
         const user = users[socket.id];
         if (!user || !user.isAdmin) {
@@ -97,14 +121,14 @@ io.on('connection', (socket) => {
         io.to(room).emit('numberDrawn', number);
         console.log(`房間 ${room} 管理員開獎: ${number}`);
 
-        // 開獎後，所有玩家卡片鎖定
+        // 廣播鎖定訊息：開獎後所有玩家卡片鎖定
         io.to(room).emit('lockCards');
 
         updateAdminInfo(room);
         updateAdminLineCounts(room);
     });
 
-    // 玩家更新完成線數
+    // 玩家更新完成線數事件
     socket.on('updateLineCount', (data) => {
         const user = users[socket.id];
         if (user && !user.isAdmin) {
@@ -114,31 +138,27 @@ io.on('connection', (socket) => {
         }
     });
 
-    // 使用者斷線
+    // 當使用者斷線時
     socket.on('disconnect', () => {
         const user = users[socket.id];
         if (user) {
             console.log(`用戶 ${user.username} 離線`);
             const room = user.room;
             delete users[socket.id];
-
             if (rooms[room]) {
                 rooms[room]--;
-                // 當該房間人數 <= 0，表示房間已無人
+                // 若房間人數 <= 0，設定 5 分鐘計時器，自動清除房間資料及開獎紀錄
                 if (rooms[room] <= 0) {
-                    // 設定 5 分鐘計時器，若期間內都沒人進房，就刪除該房間資料
                     roomTimers[room] = setTimeout(() => {
-                        // 再次確認房間人數確實為 0
                         if (rooms[room] && rooms[room] <= 0) {
                             delete rooms[room];
-                            delete drawnNumbers[room]; // <=== 關鍵：刪除該房間的開獎紀錄
+                            delete drawnNumbers[room];
                             delete roomTimers[room];
                             updateRoomsList();
                         }
                     }, 5 * 60 * 1000);
                 }
             }
-
             updateRoomsList();
             updateAdminInfo(room);
             updateAdminLineCounts(room);
@@ -148,14 +168,14 @@ io.on('connection', (socket) => {
     });
 });
 
-// 更新房間列表並廣播給所有人
+// 廣播目前所有已建立的房間列表
 function updateRoomsList() {
     const roomList = Object.keys(rooms);
     console.log("更新房間列表：", roomList);
     io.emit('roomsListUpdate', roomList);
 }
 
-// 更新管理員的玩家資訊
+// 更新指定房間內所有管理員的玩家資訊（玩家名稱與連線數）
 function updateAdminInfo(room) {
     const playerNames = [];
     let playerCount = 0;
@@ -173,7 +193,8 @@ function updateAdminInfo(room) {
     }
 }
 
-// 更新該房間內的完成線數統計，並推送給管理員
+// 更新指定房間內所有管理員的玩家完成線數統計
+// 統計格式：{ 0: [username, ...], 1: [username, ...], ..., 6: [username, ...] }
 function updateAdminLineCounts(room) {
     const lineCounts = {};
     for (let i = 0; i <= 6; i++) {
@@ -211,7 +232,6 @@ setInterval(() => {
     updateRoomsList();
 }, 30 * 60 * 1000);
 
-// 監聽 3000 埠
 server.listen(3000, () => {
     console.log('伺服器運行在 http://localhost:3000');
 });
