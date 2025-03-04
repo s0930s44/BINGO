@@ -147,16 +147,14 @@ io.on('connection', (socket) => {
             delete users[socket.id];
             if (rooms[room]) {
                 rooms[room]--;
-                // 若房間人數 <= 0，設定 5 分鐘計時器，自動清除房間資料及開獎紀錄
+                // 當房間人數 <= 0，立即刪除房間與開獎紀錄
                 if (rooms[room] <= 0) {
-                    roomTimers[room] = setTimeout(() => {
-                        if (rooms[room] && rooms[room] <= 0) {
-                            delete rooms[room];
-                            delete drawnNumbers[room];
-                            delete roomTimers[room];
-                            updateRoomsList();
-                        }
-                    }, 5 * 60 * 1000);
+                    delete rooms[room];
+                    delete drawnNumbers[room];
+                    if (roomTimers[room]) {
+                        clearTimeout(roomTimers[room]);
+                        delete roomTimers[room];
+                    }
                 }
             }
             updateRoomsList();
@@ -166,6 +164,7 @@ io.on('connection', (socket) => {
             console.log(`未知用戶離線: ${socket.id}`);
         }
     });
+
 });
 
 // 廣播目前所有已建立的房間列表
@@ -230,7 +229,7 @@ setInterval(() => {
         }
     }
     updateRoomsList();
-}, 1 * 60 * 1000);
+},  60 * 1000);
 
 server.listen(3000, () => {
     console.log('伺服器運行在 http://localhost:3000');
