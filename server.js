@@ -8,7 +8,7 @@ const app = express();
 
 // 設定 CORS，允許前端 (例如 http://localhost:5173) 請求
 app.use(cors({
-    origin: 'http://localhost:5173',
+    origin: '*',
     methods: ['GET', 'POST'],
     credentials: true
 }));
@@ -16,7 +16,7 @@ app.use(cors({
 const server = http.createServer(app);
 const io = new Server(server, {
     cors: {
-        origin: 'http://localhost:5173',
+        origin: '*',
         methods: ['GET', 'POST'],
         credentials: true
     }
