@@ -197,13 +197,13 @@ function updateAdminInfo(room) {
 // 統計格式：{ 0: [username, ...], 1: [username, ...], ..., 6: [username, ...] }
 function updateAdminLineCounts(room) {
     const lineCounts = {};
-    for (let i = 0; i <= 6; i++) {
+    for (let i = 0; i <= 14; i++) {
         lineCounts[i] = [];
     }
     for (let id in users) {
         if (users[id].room === room && !users[id].isAdmin) {
             const lc = users[id].lineCount || 0;
-            if (lc >= 0 && lc <= 6) {
+            if (lc >= 0 && lc <= 14) {
                 lineCounts[lc].push(users[id].username);
             }
         }
@@ -230,7 +230,7 @@ setInterval(() => {
         }
     }
     updateRoomsList();
-}, 30 * 60 * 1000);
+}, 1 * 60 * 1000);
 
 server.listen(3000, () => {
     console.log('伺服器運行在 http://localhost:3000');
