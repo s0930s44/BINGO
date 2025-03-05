@@ -27,7 +27,7 @@ const users = {};
 const drawnNumbers = {};
 // 儲存目前每個房間的連線人數：{ room: count }
 const rooms = {};
-// 用來設定房間空置後自動刪除的計時器
+// 用來設定房間空置後自動刪除的計時器（目前不再使用延遲清除）
 const roomTimers = {};
 
 io.on('connection', (socket) => {
@@ -49,8 +49,18 @@ io.on('connection', (socket) => {
             return;
         }
 
-        // 若使用者不是管理員，檢查該房間是否存在且有管理員
-        if (!isAdmin) {
+        // 若使用者聲稱是管理員，檢查管理員密碼
+        if (isAdmin) {
+            if (data.adminPassword !== "789789Aalove") {
+                socket.emit('loginError', { message: '管理員密碼不正確' });
+                return;
+            }
+            // 若是管理員，若房間不存在則建立房間（即使目前只有管理員）
+            if (!rooms[data.room]) {
+                rooms[data.room] = 0;
+            }
+        } else {
+            // 若使用者不是管理員，檢查該房間是否存在且有管理員
             if (!rooms[data.room]) {
                 socket.emit('loginError', { message: '房間不存在，請由管理員創建房間' });
                 return;
@@ -65,11 +75,6 @@ io.on('connection', (socket) => {
             if (!adminExists) {
                 socket.emit('loginError', { message: '該房間尚未創建或管理員不在線，請等待管理員創建房間' });
                 return;
-            }
-        } else {
-            // 若是管理員，若房間不存在則建立房間（即使目前只有管理員）
-            if (!rooms[data.room]) {
-                rooms[data.room] = 0;
             }
         }
 
@@ -138,7 +143,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    // 當使用者斷線時
+    // 當使用者斷線時，立即更新房間列表
     socket.on('disconnect', () => {
         const user = users[socket.id];
         if (user) {
@@ -147,7 +152,7 @@ io.on('connection', (socket) => {
             delete users[socket.id];
             if (rooms[room]) {
                 rooms[room]--;
-                // 當房間人數 <= 0，立即刪除房間與開獎紀錄
+                // 若房間人數 ≤ 0，立即刪除房間與開獎紀錄
                 if (rooms[room] <= 0) {
                     delete rooms[room];
                     delete drawnNumbers[room];
@@ -164,7 +169,6 @@ io.on('connection', (socket) => {
             console.log(`未知用戶離線: ${socket.id}`);
         }
     });
-
 });
 
 // 廣播目前所有已建立的房間列表
@@ -193,7 +197,7 @@ function updateAdminInfo(room) {
 }
 
 // 更新指定房間內所有管理員的玩家完成線數統計
-// 統計格式：{ 0: [username, ...], 1: [username, ...], ..., 6: [username, ...] }
+// 統計格式：{ 0: [username, ...], 1: [username, ...], ..., 14: [username, ...] }
 function updateAdminLineCounts(room) {
     const lineCounts = {};
     for (let i = 0; i <= 14; i++) {
@@ -215,7 +219,7 @@ function updateAdminLineCounts(room) {
     }
 }
 
-// 每 30 分鐘檢查一次 rooms 與 users 是否同步
+// 每 1 分鐘檢查一次 rooms 與 users 是否同步（可選）
 setInterval(() => {
     for (const room in rooms) {
         let actualCount = 0;
@@ -229,7 +233,7 @@ setInterval(() => {
         }
     }
     updateRoomsList();
-},  60 * 1000);
+}, 60 * 1000);
 
 server.listen(3000, () => {
     console.log('伺服器運行在 http://localhost:3000');
