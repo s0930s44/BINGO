@@ -54,16 +54,29 @@ async function initializeDatabase() {
             )
         `);
 
-        // 創建房間表，添加 game_started 欄位追踪遊戲開始狀態
+        // 創建房間表，新增 has_drawn 欄位標記是否已開獎
         await connection.execute(`
             CREATE TABLE IF NOT EXISTS rooms (
                 room_name VARCHAR(255) PRIMARY KEY,
                 user_count INT DEFAULT 0,
-                game_started BOOLEAN DEFAULT FALSE,
+                has_drawn BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
             )
         `);
+
+        // 檢查 has_drawn 欄位是否存在，如果不存在則添加
+        try {
+            await connection.execute(`
+                SELECT has_drawn FROM rooms LIMIT 1
+            `);
+        } catch (error) {
+            // 欄位不存在，添加它
+            await connection.execute(`
+                ALTER TABLE rooms ADD COLUMN has_drawn BOOLEAN DEFAULT FALSE
+            `);
+            console.log('已添加 has_drawn 欄位到 rooms 表');
+        }
 
         // 創建開獎號碼表
         await connection.execute(`
@@ -103,10 +116,20 @@ cleanupOldConnections();
 // 資料庫操作函數封裝
 async function getRooms() {
     try {
+        const [rows] = await pool.execute('SELECT room_name, has_drawn FROM rooms WHERE user_count > 0');
+        return rows;
+    } catch (error) {
+        console.error('取得房間列表失敗:', error);
+        return [];
+    }
+}
+
+async function getRoomNames() {
+    try {
         const [rows] = await pool.execute('SELECT room_name FROM rooms WHERE user_count > 0');
         return rows.map(row => row.room_name);
     } catch (error) {
-        console.error('取得房間列表失敗:', error);
+        console.error('取得房間名稱列表失敗:', error);
         return [];
     }
 }
@@ -121,22 +144,54 @@ async function getRoom(roomName) {
     }
 }
 
-async function createOrUpdateRoom(roomName, changeUserCount = 0) {
+async function createOrUpdateRoom(roomName, changeUserCount = 0, setHasDrawn = null) {
     try {
         const [roomRows] = await pool.execute('SELECT * FROM rooms WHERE room_name = ?', [roomName]);
         if (roomRows.length === 0) {
             // 創建新房間
-            await pool.execute('INSERT INTO rooms (room_name, user_count, game_started) VALUES (?, ?, FALSE)', [roomName, changeUserCount > 0 ? changeUserCount : 0]);
-            return { room_name: roomName, user_count: changeUserCount > 0 ? changeUserCount : 0, game_started: false };
+            await pool.execute(
+                'INSERT INTO rooms (room_name, user_count, has_drawn) VALUES (?, ?, ?)',
+                [roomName, changeUserCount > 0 ? changeUserCount : 0, setHasDrawn !== null ? setHasDrawn : false]
+            );
+            return {
+                room_name: roomName,
+                user_count: changeUserCount > 0 ? changeUserCount : 0,
+                has_drawn: setHasDrawn !== null ? setHasDrawn : false
+            };
         } else {
             // 更新現有房間
             const newCount = Math.max(0, roomRows[0].user_count + changeUserCount);
-            await pool.execute('UPDATE rooms SET user_count = ? WHERE room_name = ?', [newCount, roomName]);
-            return { room_name: roomName, user_count: newCount, game_started: roomRows[0].game_started };
+            let query = 'UPDATE rooms SET user_count = ? WHERE room_name = ?';
+            let params = [newCount, roomName];
+
+            // 如果要更新 has_drawn 狀態
+            if (setHasDrawn !== null) {
+                query = 'UPDATE rooms SET user_count = ?, has_drawn = ? WHERE room_name = ?';
+                params = [newCount, setHasDrawn, roomName];
+            }
+
+            await pool.execute(query, params);
+
+            return {
+                room_name: roomName,
+                user_count: newCount,
+                has_drawn: setHasDrawn !== null ? setHasDrawn : roomRows[0].has_drawn
+            };
         }
     } catch (error) {
         console.error(`更新房間 ${roomName} 失敗:`, error);
         return null;
+    }
+}
+
+async function markRoomAsDrawn(roomName) {
+    try {
+        await pool.execute('UPDATE rooms SET has_drawn = TRUE WHERE room_name = ?', [roomName]);
+        console.log(`房間 ${roomName} 已標記為已開獎`);
+        return true;
+    } catch (error) {
+        console.error(`標記房間 ${roomName} 已開獎失敗:`, error);
+        return false;
     }
 }
 
@@ -250,24 +305,12 @@ async function getDrawnNumbers(room) {
     }
 }
 
-// 檢查房間遊戲是否已開始
-async function isGameStarted(roomName) {
+async function hasRoomDrawnNumbers(room) {
     try {
-        const [rows] = await pool.execute('SELECT game_started FROM rooms WHERE room_name = ?', [roomName]);
-        return rows.length > 0 && rows[0].game_started;
+        const [rows] = await pool.execute('SELECT COUNT(*) as count FROM drawn_numbers WHERE room = ?', [room]);
+        return rows[0].count > 0;
     } catch (error) {
-        console.error(`檢查房間 ${roomName} 遊戲狀態失敗:`, error);
-        return false;
-    }
-}
-
-// 標記房間遊戲已開始
-async function markGameStarted(roomName) {
-    try {
-        await pool.execute('UPDATE rooms SET game_started = TRUE WHERE room_name = ?', [roomName]);
-        return true;
-    } catch (error) {
-        console.error(`標記房間 ${roomName} 遊戲已開始失敗:`, error);
+        console.error(`檢查房間 ${room} 是否有開獎號碼失敗:`, error);
         return false;
     }
 }
@@ -279,7 +322,7 @@ io.on('connection', (socket) => {
     console.log(`用戶連線: ${socket.id}`);
 
     // 連線後先發送最新房間列表給該用戶
-    getRooms().then(roomList => {
+    getRoomNames().then(roomList => {
         socket.emit('roomsListUpdate', roomList);
     });
 
@@ -296,19 +339,17 @@ io.on('connection', (socket) => {
             return;
         }
 
-        // 檢查房間是否存在
-        const room = await getRoom(data.room);
-
-        // 若使用者不是管理員，檢查該房間是否存在且有管理員，以及遊戲是否已開始
+        // 若使用者不是管理員，檢查該房間是否存在且有管理員
         if (!isAdmin) {
+            const room = await getRoom(data.room);
             if (!room) {
                 socket.emit('loginError', { message: '房間不存在，請由管理員創建房間' });
                 return;
             }
 
-            // 檢查遊戲是否已開始
-            if (room.game_started) {
-                socket.emit('loginError', { message: '遊戲已開始，無法加入此房間' });
+            // 檢查房間是否已經開獎
+            if (room.has_drawn) {
+                socket.emit('loginError', { message: '該房間已經開始遊戲，不能加入' });
                 return;
             }
 
@@ -316,6 +357,13 @@ io.on('connection', (socket) => {
             if (admins.length === 0) {
                 socket.emit('loginError', { message: '該房間尚未創建或管理員不在線，請等待管理員創建房間' });
                 return;
+            }
+        } else {
+            // 檢查房間是否已經存在且已開獎
+            const room = await getRoom(data.room);
+            if (room && room.has_drawn) {
+                // 允許管理員重新連接到已開獎房間
+                console.log(`管理員 ${data.username} 重新連接到已開獎房間 ${data.room}`);
             }
         }
 
@@ -339,7 +387,7 @@ io.on('connection', (socket) => {
     });
 
     socket.on('requestRoomsList', async () => {
-        const roomList = await getRooms();
+        const roomList = await getRoomNames();
         socket.emit('roomsListUpdate', roomList);
     });
 
@@ -365,13 +413,13 @@ io.on('connection', (socket) => {
             return;
         }
 
-        // 如果是首次開獎，標記房間遊戲已開始
+        await saveDrawnNumber(room, number);
+
+        // 標記房間為已開獎狀態（第一次開獎時）
         if (drawnNumbers.length === 0) {
-            await markGameStarted(room);
-            console.log(`房間 ${room} 遊戲開始`);
+            await markRoomAsDrawn(room);
         }
 
-        await saveDrawnNumber(room, number);
         io.to(room).emit('numberDrawn', number);
         console.log(`房間 ${room} 管理員開獎: ${number}`);
 
@@ -412,7 +460,7 @@ io.on('connection', (socket) => {
 
 // 廣播目前所有已建立的房間列表
 async function updateRoomsList() {
-    const roomList = await getRooms();
+    const roomList = await getRoomNames();
     console.log("更新房間列表：", roomList);
     io.emit('roomsListUpdate', roomList);
 }
