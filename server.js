@@ -2,7 +2,6 @@ const express = require('express');
 const cors = require('cors');
 const http = require('http');
 const { Server } = require('socket.io');
-const pool = require('./db');  // 引入剛才建立的資料庫連線模組
 
 const app = express();
 
@@ -31,67 +30,14 @@ const rooms = {};
 // 用來設定房間空置後自動刪除的計時器
 const roomTimers = {};
 
-// 建立房間：若房間不存在，管理員登入時呼叫
-async function createRoom(roomName, adminName) {
-    try {
-        await pool.query(
-            'INSERT INTO rooms (room_name, admin) VALUES (?, ?)',
-            [roomName, adminName]
-        );
-        console.log(`DB: 房間 ${roomName} 建立成功`);
-    } catch (err) {
-        console.error('DB: 建立房間錯誤：', err);
-    }
-}
-
-// 新增玩家：玩家加入時呼叫
-async function addPlayer(username, roomName, isAdmin = false) {
-    try {
-        await pool.query(
-            'INSERT INTO players (username, room_name, is_admin) VALUES (?, ?, ?)',
-            [username, roomName, isAdmin]
-        );
-        console.log(`DB: 玩家 ${username} 加入房間 ${roomName}`);
-    } catch (err) {
-        console.error('DB: 新增玩家錯誤：', err);
-    }
-}
-
-// 取得房間資料
-async function getRoom(roomName) {
-    try {
-        const [rows] = await pool.query(
-            'SELECT * FROM rooms WHERE room_name = ?',
-            [roomName]
-        );
-        return rows;
-    } catch (err) {
-        console.error('DB: 取得房間錯誤：', err);
-        return null;
-    }
-}
-
-// 刪除房間：當房間空置時，從資料庫中刪除房間（ON DELETE CASCADE 自動清除玩家資料）
-async function deleteRoomFromDB(roomName) {
-    try {
-        await pool.query(
-            'DELETE FROM rooms WHERE room_name = ?',
-            [roomName]
-        );
-        console.log(`DB: 房間 ${roomName} 已刪除`);
-    } catch (err) {
-        console.error('DB: 刪除房間錯誤：', err);
-    }
-}
-
 io.on('connection', (socket) => {
     console.log(`用戶連線: ${socket.id}`);
 
-    // 連線後先發送最新房間列表給該用戶（後續你可以改從資料庫中查詢）
+    // 連線後先發送最新房間列表給該用戶
     socket.emit('roomsListUpdate', Object.keys(rooms));
 
     // 使用者登入事件
-    socket.on('login', async (data) => {
+    socket.on('login', (data) => {
         // 驗證 username 與 room 是否存在且為字串
         if (!data.username || !data.room || typeof data.username !== 'string' || typeof data.room !== 'string') {
             socket.emit('loginError', { message: '使用者名稱與房間名稱不能為空，且必須為字串' });
@@ -103,23 +49,32 @@ io.on('connection', (socket) => {
             return;
         }
 
+        // 若使用者不是管理員，檢查該房間是否存在且有管理員
         if (!isAdmin) {
-            // 如果是玩家，先檢查資料庫中房間是否存在
-            const roomData = await getRoom(data.room);
-            if (!roomData || roomData.length === 0) {
+            if (!rooms[data.room]) {
                 socket.emit('loginError', { message: '房間不存在，請由管理員創建房間' });
                 return;
             }
+            let adminExists = false;
+            for (const id in users) {
+                if (users[id].room === data.room && users[id].isAdmin) {
+                    adminExists = true;
+                    break;
+                }
+            }
+            if (!adminExists) {
+                socket.emit('loginError', { message: '該房間尚未創建或管理員不在線，請等待管理員創建房間' });
+                return;
+            }
         } else {
-            // 若是管理員，若房間不存在則建立房間
-            const roomData = await getRoom(data.room);
-            if (!roomData || roomData.length === 0) {
-                await createRoom(data.room, data.username);
+            // 若是管理員，若房間不存在則建立房間（即使目前只有管理員）
+            if (!rooms[data.room]) {
+                rooms[data.room] = 0;
             }
         }
 
         // 更新房間人數（不論管理員或玩家，都要加1）
-        rooms[data.room] = (rooms[data.room] || 0) + 1;
+        rooms[data.room]++;
         // 儲存使用者資料並加入房間
         users[socket.id] = { username: data.username, room: data.room, isAdmin };
         socket.join(data.room);
@@ -134,11 +89,6 @@ io.on('connection', (socket) => {
         if (roomTimers[data.room]) {
             clearTimeout(roomTimers[data.room]);
             delete roomTimers[data.room];
-        }
-
-        // 如果是玩家，新增玩家資料到資料庫
-        if (!isAdmin) {
-            await addPlayer(data.username, data.room, false);
         }
 
         updateRoomsList();
@@ -189,7 +139,7 @@ io.on('connection', (socket) => {
     });
 
     // 當使用者斷線時
-    socket.on('disconnect', async () => {
+    socket.on('disconnect', () => {
         const user = users[socket.id];
         if (user) {
             console.log(`用戶 ${user.username} 離線`);
@@ -197,7 +147,7 @@ io.on('connection', (socket) => {
             delete users[socket.id];
             if (rooms[room]) {
                 rooms[room]--;
-                // 當房間人數 <= 0，立即刪除房間與開獎紀錄，同時清除資料庫中該房間資料
+                // 當房間人數 <= 0，立即刪除房間與開獎紀錄
                 if (rooms[room] <= 0) {
                     delete rooms[room];
                     delete drawnNumbers[room];
@@ -205,8 +155,6 @@ io.on('connection', (socket) => {
                         clearTimeout(roomTimers[room]);
                         delete roomTimers[room];
                     }
-                    // 刪除資料庫中的房間 (ON DELETE CASCADE 將刪除對應的玩家資料)
-                    await deleteRoomFromDB(room);
                 }
             }
             updateRoomsList();
@@ -216,6 +164,7 @@ io.on('connection', (socket) => {
             console.log(`未知用戶離線: ${socket.id}`);
         }
     });
+
 });
 
 // 廣播目前所有已建立的房間列表
@@ -244,6 +193,7 @@ function updateAdminInfo(room) {
 }
 
 // 更新指定房間內所有管理員的玩家完成線數統計
+// 統計格式：{ 0: [username, ...], 1: [username, ...], ..., 6: [username, ...] }
 function updateAdminLineCounts(room) {
     const lineCounts = {};
     for (let i = 0; i <= 14; i++) {
@@ -265,7 +215,7 @@ function updateAdminLineCounts(room) {
     }
 }
 
-// 每 60 分鐘檢查一次 rooms 與 users 是否同步
+// 每 30 分鐘檢查一次 rooms 與 users 是否同步
 setInterval(() => {
     for (const room in rooms) {
         let actualCount = 0;
@@ -279,7 +229,7 @@ setInterval(() => {
         }
     }
     updateRoomsList();
-}, 60 * 1000);
+},  60 * 1000);
 
 server.listen(3000, () => {
     console.log('伺服器運行在 http://localhost:3000');
